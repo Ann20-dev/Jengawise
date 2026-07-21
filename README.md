@@ -45,3 +45,7 @@ Without environment variables, the app still runs with seeded demo intelligence.
 ## Database
 
 The initial PostgreSQL schema is in `supabase/schema.sql`.
+
+## Map boundary data
+
+`public/data/nairobi-sub-counties.geojson` contains the 17 Nairobi sub-county boundaries extracted from the [HDX Kenya Subnational Administrative Boundaries dataset](https://data.humdata.org/dataset/cod-ab-ken), downloaded on July 21, 2026. It is used only to display boundaries and summarize this project's seeded property and pipeline points; it is not a source of property-market data.

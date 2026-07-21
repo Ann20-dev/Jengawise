@@ -11,13 +11,66 @@ type MarketMapProps = {
   compact?: boolean;
 };
 
+type BoundaryFeature = {
+  properties: {
+    adm2_name: string;
+  };
+  geometry: {
+    type: "Polygon" | "MultiPolygon";
+    coordinates: number[][][] | number[][][][];
+  };
+};
+
+type BoundarySummary = {
+  name: string;
+  propertyUnits: number;
+  pipelineUnits: number;
+  projectCount: number;
+};
+
 const token = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
+
+function pointInRing([longitude, latitude]: [number, number], ring: number[][]) {
+  let inside = false;
+
+  for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index++) {
+    const [currentLongitude, currentLatitude] = ring[index];
+    const [previousLongitude, previousLatitude] = ring[previous];
+    const intersects =
+      currentLatitude > latitude !== previousLatitude > latitude &&
+      longitude < ((previousLongitude - currentLongitude) * (latitude - currentLatitude)) / (previousLatitude - currentLatitude) + currentLongitude;
+
+    if (intersects) inside = !inside;
+  }
+
+  return inside;
+}
+
+function pointInBoundary(point: [number, number], geometry: BoundaryFeature["geometry"]) {
+  const polygons = geometry.type === "Polygon" ? [geometry.coordinates as number[][][]] : geometry.coordinates as number[][][][];
+
+  return polygons.some((polygon) => pointInRing(point, polygon[0]) && !polygon.slice(1).some((ring) => pointInRing(point, ring)));
+}
+
+function getBoundarySummary(feature: BoundaryFeature): BoundarySummary {
+  const containedProperties = properties.filter((property) => pointInBoundary(property.coordinates, feature.geometry));
+  const containedPipeline = pipelineProjects.filter((project) => pointInBoundary(project.coordinates, feature.geometry));
+
+  return {
+    name: feature.properties.adm2_name,
+    propertyUnits: containedProperties.reduce((total, property) => total + property.units, 0),
+    pipelineUnits: containedPipeline.reduce((total, project) => total + project.units, 0),
+    projectCount: containedProperties.length + containedPipeline.length
+  };
+}
 
 export function MarketMap({ compact = false }: MarketMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<mapboxgl.Map | null>(null);
   const markerRefs = useRef<mapboxgl.Marker[]>([]);
+  const boundaryPopupRef = useRef<mapboxgl.Popup | null>(null);
   const [markerType, setMarkerType] = useState<MarkerType>("both");
+  const [selectedBoundary, setSelectedBoundary] = useState<BoundarySummary | null>(null);
 
   const points = useMemo(() => {
     const propertyPoints = properties.map((property) => ({
@@ -47,18 +100,65 @@ export function MarketMap({ compact = false }: MarketMapProps) {
     if (!token || !containerRef.current || mapRef.current) return;
 
     mapboxgl.accessToken = token;
-    mapRef.current = new mapboxgl.Map({
+    const map = new mapboxgl.Map({
       container: containerRef.current,
       style: "mapbox://styles/mapbox/light-v11",
       center: [36.8219, -1.2921],
       zoom: 10.6
     });
+    mapRef.current = map;
 
-    mapRef.current.addControl(new mapboxgl.NavigationControl({ showCompass: false }), "bottom-right");
+    map.addControl(new mapboxgl.NavigationControl({ showCompass: false }), "bottom-right");
+    boundaryPopupRef.current = new mapboxgl.Popup({ closeButton: false, closeOnClick: false, offset: 10 });
+
+    map.on("load", async () => {
+      try {
+        const response = await fetch("/data/nairobi-sub-counties.geojson");
+        if (!response.ok) return;
+
+        const boundaries = await response.json();
+        map.addSource("nairobi-sub-counties", { type: "geojson", data: boundaries });
+        map.addLayer({
+          id: "nairobi-sub-counties-fill",
+          type: "fill",
+          source: "nairobi-sub-counties",
+          paint: { "fill-color": "#2e6b57", "fill-opacity": 0.08 }
+        });
+        map.addLayer({
+          id: "nairobi-sub-counties-outline",
+          type: "line",
+          source: "nairobi-sub-counties",
+          paint: { "line-color": "#2e6b57", "line-width": 1.4, "line-opacity": 0.72 }
+        });
+
+        map.on("mouseenter", "nairobi-sub-counties-fill", () => {
+          map.getCanvas().style.cursor = "pointer";
+        });
+        map.on("mousemove", "nairobi-sub-counties-fill", (event) => {
+          const feature = event.features?.[0] as unknown as BoundaryFeature | undefined;
+          if (!feature) return;
+          boundaryPopupRef.current
+            ?.setLngLat(event.lngLat)
+            .setHTML(`<strong>${feature.properties.adm2_name}</strong><br/>Nairobi sub-county`)
+            .addTo(map);
+        });
+        map.on("mouseleave", "nairobi-sub-counties-fill", () => {
+          map.getCanvas().style.cursor = "";
+          boundaryPopupRef.current?.remove();
+        });
+        map.on("click", "nairobi-sub-counties-fill", (event) => {
+          const feature = event.features?.[0] as unknown as BoundaryFeature | undefined;
+          if (feature) setSelectedBoundary(getBoundarySummary(feature));
+        });
+      } catch {
+        // The marker map remains available if the boundary asset cannot load.
+      }
+    });
 
     return () => {
       markerRefs.current.forEach((marker) => marker.remove());
-      mapRef.current?.remove();
+      boundaryPopupRef.current?.remove();
+      map.remove();
       mapRef.current = null;
     };
   }, []);
@@ -92,7 +192,7 @@ export function MarketMap({ compact = false }: MarketMapProps) {
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-5 py-4">
         <div>
           <h2 className="text-base font-semibold text-ink">Interactive Supply Map</h2>
-          <p className="text-sm text-ink/62">Properties and construction pipeline by zone.</p>
+          <p className="text-sm text-ink/62">Properties, pipeline, and Nairobi sub-county boundaries.</p>
         </div>
         <div className="flex items-center gap-2 rounded-md border border-line bg-field p-1">
           <SlidersHorizontal size={16} className="ml-2 text-ink/55" aria-hidden="true" />
@@ -112,7 +212,28 @@ export function MarketMap({ compact = false }: MarketMapProps) {
       </div>
 
       {token ? (
-        <div ref={containerRef} className={compact ? "h-[360px]" : "h-[560px]"} />
+        <>
+          <div ref={containerRef} className={compact ? "h-[360px]" : "h-[560px]"} />
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-line px-5 py-3 text-xs text-ink/60">
+            <p>Hover for a sub-county name; click a boundary for its tracked supply summary.</p>
+            <a
+              href="https://data.humdata.org/dataset/cod-ab-ken"
+              target="_blank"
+              rel="noreferrer"
+              className="font-semibold text-moss hover:text-ink"
+            >
+              Boundary data: HDX
+            </a>
+          </div>
+          {selectedBoundary ? (
+            <div className="grid gap-3 border-t border-line bg-field px-5 py-4 sm:grid-cols-4">
+              <p className="text-sm font-semibold text-ink">{selectedBoundary.name}</p>
+              <p className="text-sm text-ink/68">{selectedBoundary.propertyUnits.toLocaleString()} property units</p>
+              <p className="text-sm text-ink/68">{selectedBoundary.pipelineUnits.toLocaleString()} pipeline units</p>
+              <p className="text-sm text-ink/68">{selectedBoundary.projectCount} tracked projects</p>
+            </div>
+          ) : null}
+        </>
       ) : (
         <div className={`relative overflow-hidden grid-paper street-lines ${compact ? "h-[360px]" : "h-[560px]"}`}>
           <div className="absolute inset-0 bg-paper/38" />
